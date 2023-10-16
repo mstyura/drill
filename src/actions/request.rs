@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use colored::Colorize;
 use reqwest::{
   header::{self, HeaderMap, HeaderName, HeaderValue},
-  ClientBuilder, Method, Response,
+  ClientBuilder, Method,
 };
 use std::fmt::Write;
 use url::Url;
@@ -35,6 +35,25 @@ pub struct Request {
   pub with_item: Option<Yaml>,
   pub index: Option<u32>,
   pub assign: Option<String>,
+}
+
+struct Response {
+  url: Url,
+  headers: reqwest::header::HeaderMap,
+  status: reqwest::StatusCode,
+  body: Option<bytes::Bytes>,
+  time_to_response_headers_read: Duration,
+  time_to_response_body_read: Duration,
+}
+
+impl Response {
+  fn cookies(&self) -> impl Iterator<Item = cookie::Cookie<'_>> {
+    self.headers.get_all(reqwest::header::SET_COOKIE).iter().flat_map(|value| {
+      let str = std::str::from_utf8(value.as_bytes()).ok()?;
+      let cookie = cookie::Cookie::parse(str).ok()?;
+      Some(cookie.into_owned())
+    })
+  }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -100,7 +119,7 @@ impl Request {
     }
   }
 
-  async fn send_request(&self, context: &mut Context, pool: &Pool, config: &Config) -> (Option<Response>, f64) {
+  async fn send_request(&self, context: &mut Context, pool: &Pool, config: &Config) -> (Option<Response>, Duration) {
     let mut uninterpolator = None;
 
     // Resolve the name
@@ -193,18 +212,46 @@ impl Request {
 
     let begin = Instant::now();
     let response_result = client.execute(request).await;
-    let duration_ms = begin.elapsed().as_secs_f64() * 1000.0;
 
     match response_result {
       Err(e) => {
+        let duration = begin.elapsed();
         if !config.quiet || config.verbose {
           println!("Error connecting '{}': {:?}", interpolated_base_url.as_str(), e);
         }
-        (None, duration_ms)
+        (None, duration)
       }
-      Ok(response) => {
+      Ok(mut response) => {
+        let time_to_response_headers_read = begin.elapsed();
+        let status: reqwest::StatusCode = response.status();
+        let headers = response.headers().to_owned();
+        let url = response.url().to_owned();
+        let body = {
+          if self.assign.is_some() {
+            match response.bytes().await {
+              Ok(bytes) => Some(bytes),
+              Err(err) => {
+                println!("Error reading response body '{}': {:?}", interpolated_base_url.as_str(), err);
+                return (None, begin.elapsed());
+              }
+            }
+          } else {
+            loop {
+              match response.chunk().await {
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(err) => {
+                  println!("Error reading response body '{}': {:?}", interpolated_base_url.as_str(), err);
+                  return (None, begin.elapsed());
+                }
+              }
+            }
+            None
+          }
+        };
+
+        let time_to_response_body_read = begin.elapsed();
         if !config.quiet {
-          let status = response.status();
           let status_text = if status.is_server_error() {
             status.to_string().red()
           } else if status.is_client_error() {
@@ -213,10 +260,20 @@ impl Request {
             status.to_string().yellow()
           };
 
-          println!("{:width$} {} {} {}", interpolated_name.green(), interpolated_base_url.blue().bold(), status_text, Request::format_time(duration_ms, config.nanosec).cyan(), width = 25);
+          println!("{:width$} {} {} {}", interpolated_name.green(), interpolated_base_url.blue().bold(), status_text, Request::format_time(time_to_response_body_read.as_millis() as f64, config.nanosec).cyan(), width = 25);
         }
 
-        (Some(response), duration_ms)
+        (
+          Some(Response {
+            url,
+            headers,
+            status,
+            body,
+            time_to_response_headers_read,
+            time_to_response_body_read,
+          }),
+          time_to_response_body_read,
+        )
       }
     }
   }
@@ -261,10 +318,11 @@ impl Runnable for Request {
       context.insert("index".to_string(), json!(self.index.unwrap()));
     }
 
-    let (res, duration_ms) = self.send_request(context, pool, config).await;
+    let (res, duration) = self.send_request(context, pool, config).await;
+    let duration_ms = duration.as_secs_f64() * 1000.0;
 
     let log_message_response = if config.verbose {
-      Some(log_message_response(&res, duration_ms))
+      Some(log_message_response(&res))
     } else {
       None
     };
@@ -276,7 +334,7 @@ impl Runnable for Request {
         status: 520u16,
       }),
       Some(response) => {
-        let status = response.status().as_u16();
+        let status = response.status.as_u16();
 
         reports.push(Report {
           name: self.name.to_owned(),
@@ -292,13 +350,13 @@ impl Runnable for Request {
         let data = if let Some(ref key) = self.assign {
           let mut headers = Map::new();
 
-          response.headers().iter().for_each(|(header, value)| {
+          response.headers.iter().for_each(|(header, value)| {
             headers.insert(header.to_string(), json!(value.to_str().unwrap()));
           });
 
-          let data = response.text().await.unwrap();
+          let data = response.body.unwrap();
 
-          let body: Value = serde_json::from_str(&data).unwrap_or(serde_json::Value::Null);
+          let body: Value = serde_json::from_slice(&data).unwrap_or(serde_json::Value::Null);
 
           let assigned = AssignedRequest {
             status,
@@ -332,14 +390,15 @@ fn log_request(request: &reqwest::Request) {
   println!("{message}");
 }
 
-fn log_message_response(response: &Option<reqwest::Response>, duration_ms: f64) -> String {
+fn log_message_response(response: &Option<Response>) -> String {
   let mut message = String::new();
   match response {
     Some(response) => {
-      write!(message, " {} {},", "URL:".bold(), response.url()).unwrap();
-      write!(message, " {} {},", "STATUS:".bold(), response.status()).unwrap();
-      write!(message, " {} {:?}", "HEADERS:".bold(), response.headers()).unwrap();
-      write!(message, " {} {:.4} ms,", "DURATION:".bold(), duration_ms).unwrap();
+      write!(message, " {} {},", "URL:".bold(), response.url).unwrap();
+      write!(message, " {} {},", "STATUS:".bold(), response.status).unwrap();
+      write!(message, " {} {:?}", "HEADERS:".bold(), response.headers).unwrap();
+      write!(message, " {} {:.4} ms,", "DURATION (headers):".bold(), Request::format_time(response.time_to_response_headers_read.as_millis() as f64, true).cyan()).unwrap();
+      write!(message, " {} {:.4} ms,", "DURATION (body):".bold(), Request::format_time(response.time_to_response_body_read.as_millis() as f64, true).cyan()).unwrap();
     }
     None => {
       message = String::from("No response from server!");
@@ -348,7 +407,7 @@ fn log_message_response(response: &Option<reqwest::Response>, duration_ms: f64) 
   message
 }
 
-fn log_response(log_message_response: String, body: &Option<String>) {
+fn log_response(log_message_response: String, body: &Option<bytes::Bytes>) {
   let mut message = String::new();
   write!(message, "{}{}", "<<<".bold().green(), log_message_response).unwrap();
   if let Some(body) = body.as_ref() {

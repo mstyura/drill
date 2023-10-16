@@ -238,8 +238,10 @@ name = "drill"
 version = "0.8.3"
 dependencies = [
  "async-trait",
+ "bytes",
  "clap",
  "colored",
+ "cookie",
  "csv",
  "futures",
  "hdrhistogram",
